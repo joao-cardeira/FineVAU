@@ -1,381 +1,367 @@
 #!/usr/bin/env python3
-"""Evaluate Qwen2.5-VL on the FineW3 dataset."""
+"""FineVAU evaluation: an LVLM describes FineW3 videos, a judge scores the descriptions, FV-Score summarises them.
+
+    python run_evaluation.py generate --video-dir /path/to/videos
+    python run_evaluation.py judge
+    python run_evaluation.py score
+"""
 
 import argparse
+import atexit
 import json
+import logging
 import os
-from typing import List, Dict, Any
-from datasets import load_dataset
-from vllm import LLM, SamplingParams
-from transformers import AutoProcessor
-from google.genai import types
-from tqdm import tqdm
+import signal
+import sys
 
-try:
-    from qwen_vl_utils import process_vision_info
-except ImportError:
-    raise ImportError("qwen_vl_utils is required: pip install qwen-vl-utils")
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
-try:
-    from google import genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
+import scoring
+from prompts import JUDGE_PROMPT, MODEL_PROMPT
 
-# Prompt for the LVLM to generate video descriptions
-PROMPT_TEMPLATE = """Please provide a comprehensive description of the video.
-In your description, detail:
-- the setting, including the location, the time_of_day, the lighting conditions, the crowd density and the main salient feature of the location.
-- any objects (e.g. people, vehicles, animals, or other objects in general) and physical attributes:
-  - for people: their clothing, approximate age, gender and any prominent salient features
-  - for other objects: category, colors
-- the sequence of events in the video, with a particular emphasis on abnormal, criminal, dangerous or illegal events.
-Ensure your description is as comprehensive and precise as possible."""
+DATASET = "joao-cardeira/FineW3"
+DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
+DEFAULT_JUDGE = "google/gemma-4-31B-it"
 
-# Prompt for Gemini to evaluate the model's answer against ground truth
-EVAL_PROMPT_TEMPLATE = """You are an impartial AI evaluator for a video anomaly understanding task. Your role is to compare a model's textual description of a video (`MODEL_ANSWER`) with a structured JSON representation of the ground truth (`GROUND_TRUTH_JSON`).
-
-Your task is to meticulously evaluate the `MODEL_ANSWER` against the `GROUND_TRUTH_JSON` and produce a single JSON object as your output. Do not include any explanatory text before or after the JSON object.
-
-Follow these evaluation criteria precisely:
-
-1. Location Evaluation: For each key in the `Location` object of the ground truth (e.g., "environment", "time_of_day"), determine if the `MODEL_ANSWER` correctly identifies its value.
-   - Score `1` if the information is present and correct.
-   - Score `0` if the information is missing or incorrect.
-
-2. Entity Evaluation: For each entity listed in the `Entity` array of the ground truth:
-   - `presence_score`: Score `1` if the entity (identified by its "id") is mentioned in the `MODEL_ANSWER`. Score `0` if it is not mentioned.
-   - `attributes`: For each attribute of the entity (e.g., "color", "clothing"), score `1` if the `MODEL_ANSWER` correctly states the attribute. Score `0` if it's missing or incorrect.
-
-3. Event Evaluation: For each event in the `Event` array of the ground truth:
-   - `score`: Compare the ground truth `event_description` with the `MODEL_ANSWER`.
-     - Score `2` (Perfect Match): The `MODEL_ANSWER` accurately and completely describes the event.
-     - Score `1` (Partial Match): The `MODEL_ANSWER` describes some aspects of the event correctly but misses key details or contains minor inaccuracies.
-     - Score `0` (Mismatch/Miss): The `MODEL_ANSWER` fails to describe the event or provides a completely incorrect description.
-
-Your output MUST be a single, valid JSON object structured exactly as follows:
-{{
-  "location": {{
-    "environment": <0 or 1>,
-    "time_of_day": <0 or 1>,
-    "lighting_conditions": <0 or 1>,
-    "crowd_density": <0 or 1>,
-    "salient_feature": <0 or 1>
-  }},
-  "entity": [
-    {{
-      "id": "<ground_truth_entity_id>",
-      "presence_score": <0 or 1>,
-      "attributes": {{
-        "<attribute_name>": <0 or 1>,
-        ...
-      }}
-    }},
-    ...
-  ],
-  "event": [
-    {{
-      "event_description": "<ground_truth_event_description>",
-      "score": <0, 1, or 2>
-    }},
-    ...
-  ]
-}}
-
-<GROUND_TRUTH_JSON>
-{ground_truth}
-</GROUND_TRUTH_JSON>
-
-<MODEL_ANSWER>
-{model_answer}
-</MODEL_ANSWER>"""
+log = logging.getLogger("finevau")
+_ENGINES = []
 
 
-def load_finew3_dataset():
-    """Load the FineW3 dataset from HuggingFace."""
-    return load_dataset("jaca-pereira/FineW3", split="test")
+def track_engine(llm):
+    _ENGINES.append(llm)
+    return llm
 
 
-def create_model(
-    model_name: str,
-    tensor_parallel_size: int,
-    gpu_memory_utilization: float,
-    mm_processor_cache_gb: float,
-):
-    """Initialize the vLLM model and processor."""
-    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-
-    llm = LLM(
-        model=model_name,
-        tensor_parallel_size=tensor_parallel_size,
-        gpu_memory_utilization=gpu_memory_utilization,
-        #mm_processor_cache_gb=mm_processor_cache_gb,
-        #dtype="bfloat16",
-        #trust_remote_code=True,
-        #max_num_seqs=1,
-    )
-
-    return llm, processor
+def shutdown_engines():
+    while _ENGINES:
+        llm = _ENGINES.pop()
+        shutdown = getattr(getattr(getattr(llm, "llm_engine", None), "engine_core", None), "shutdown", None)
+        if not callable(shutdown):
+            log.warning("could not shut the vLLM engine down")
+            continue
+        try:
+            shutdown(timeout=30)
+            log.info("vLLM engine shut down")
+        except Exception as e:
+            log.warning("vLLM engine shutdown failed: %s", e)
 
 
-def prepare_inference_input(processor: AutoProcessor, video_path: str, prompt: str) -> Dict[str, Any]:
-    """Prepare input for a single video (without running inference)."""
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "video", "video": video_path, "fps": 1.0},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
+def install_signal_handlers():
+    def handler(signum, _frame):
+        print(f"\nreceived {signal.Signals(signum).name}, shutting vLLM down", file=sys.stderr, flush=True)
+        shutdown_engines()
+        os._exit(128 + signum)
 
-    prompt_text = processor.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=False
-    )
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, handler)
 
-    image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages,
-        return_video_kwargs=True
-    )
 
-    mm_data = {}
-    if image_inputs:
-        mm_data["image"] = image_inputs
-    if video_inputs:
-        mm_data["video"] = video_inputs
+atexit.register(shutdown_engines)
 
+
+def load_llm(model, args):
+    from vllm import LLM
+
+    return track_engine(LLM(
+        model=model,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+        trust_remote_code=True,
+    ))
+
+
+def load_finew3(args):
+    from datasets import load_dataset
+
+    ds = load_dataset(args.dataset, split="test")
+    if "all" not in args.sources:
+        ds = ds.filter(lambda s: s["source"] in args.sources)
+    if args.limit:
+        ds = ds.select(range(min(args.limit, len(ds))))
+    return ds
+
+
+def ground_truth_json(sample):
+    gt = {k: json.loads(sample[k]) if sample[k] else None for k in ("events", "entities", "scene")}
     return {
-        "prompt": prompt_text,
-        "multi_modal_data": mm_data,
-        "mm_processor_kwargs": video_kwargs
+        "Location": gt["scene"],
+        "Entity": gt["entities"],
+        "Event": gt["events"].get("refined_events", []) if gt["events"] else [],
     }
 
 
-def run_batch_inference(llm: LLM, processor: AutoProcessor, inputs: List[Dict[str, Any]]) -> List[str]:
-    """Run inference on a batch of prepared inputs."""
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=2048,
-        stop=[processor.tokenizer.eos_token],
+def build_judge_prompt(sample, answer):
+    return JUDGE_PROMPT.format(ground_truth=json.dumps(ground_truth_json(sample), indent=2), model_answer=answer)
+
+
+def read_jsonl(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        lines = [line for line in f if line.strip()]
+    rows = []
+    for n, line in enumerate(lines):
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            if n != len(lines) - 1:
+                raise ValueError(f"{path}: line {n + 1} is not valid JSON")
+            log.warning("%s: ignoring an incomplete last line", path)
+    return rows
+
+
+def append_jsonl(path, rows):
+    with open(path, "a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def chunks(items, size):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def prepare_video_input(processor, path, args):
+    from qwen_vl_utils import process_vision_info
+
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "video", "video": path, "fps": args.fps, "min_pixels": args.min_pixels, "max_pixels": args.max_pixels},
+            {"type": "text", "text": MODEL_PROMPT},
+        ],
+    }]
+    prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    _, videos, video_kwargs = process_vision_info(
+        messages,
+        image_patch_size=processor.image_processor.patch_size,
+        return_video_kwargs=True,
+        return_video_metadata=True,
     )
-
-    outputs = llm.generate(inputs, sampling_params)
-
-    return [output.outputs[0].text for output in outputs]
+    request = {"prompt": prompt, "multi_modal_data": {"video": videos}, "mm_processor_kwargs": video_kwargs}
+    return request, prompt.rstrip().endswith("<think>")
 
 
-def evaluate_response(prediction: str, ground_truth: dict, gemini_client=None, gemini_model_name: str = None) -> dict:
-    """Evaluate model response using Gemini as judge."""
-    if gemini_client is None:
-        # Return placeholder scores if Gemini is not configured
-        return {"raw_scores": None, "error": "Gemini not configured"}
+def cmd_generate(args):
+    from tqdm import tqdm
+    from transformers import AutoProcessor
+    from vllm import SamplingParams
 
-    # Build ground truth JSON in expected format
-    gt_json = {
-        "Location": ground_truth.get("scene", {}),
-        "Entity": ground_truth.get("entities", []),
-        "Event": ground_truth.get("events", {}).get("refined_events", []) if ground_truth.get("events") else [],
-    }
+    have = {}
+    for r in read_jsonl(args.output):
+        have.setdefault(r["video_id"], set()).add(r["sample"])
+    todo = [s for s in load_finew3(args) if not have.get(s["video_id"], set()) >= set(range(args.k))]
+    log.info("%d videos to describe, %d answers each", len(todo), args.k)
+    if not todo:
+        return 0
 
-    eval_prompt = EVAL_PROMPT_TEMPLATE.format(
-        ground_truth=json.dumps(gt_json, indent=2),
-        model_answer=prediction,
+    params = SamplingParams(
+        n=args.k, seed=args.seed, max_tokens=args.max_new_tokens, temperature=args.temperature, top_p=args.top_p,
+        top_k=args.top_k, min_p=args.min_p, presence_penalty=args.presence_penalty,
+        repetition_penalty=args.repetition_penalty,
     )
-
+    processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
+    llm = load_llm(args.model, args)
     try:
-        response = gemini_client.models.generate_content(
-            model=gemini_model_name,
-            contents=eval_prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.0
-            )
-        )
-        response_text = response.text.strip()
+        for batch in tqdm(list(chunks(todo, args.batch_size)), desc="generate"):
+            requests, ready = [], []
+            for s in batch:
+                path = os.path.join(args.video_dir, f"{s['video_id']}.mp4")
+                if not os.path.exists(path):
+                    log.warning("missing video %s", path)
+                    continue
+                try:
+                    request, thinking = prepare_video_input(processor, path, args)
+                except Exception as e:
+                    log.warning("could not read %s: %s", path, e)
+                    continue
+                requests.append(request)
+                ready.append((s, thinking))
+            if not requests:
+                continue
+            rows = []
+            for (s, thinking), out in zip(ready, llm.generate(requests, params)):
+                for c in sorted(out.outputs, key=lambda c: c.index):
+                    rows.append({
+                        "video_id": s["video_id"], "sample": c.index, "source": s["source"],
+                        "answer": scoring.strip_reasoning(c.text, thinking), "output": c.text, "thinking": thinking,
+                        "finish_reason": str(c.finish_reason), "output_tokens": len(c.token_ids),
+                    })
+            append_jsonl(args.output, rows)
+    finally:
+        shutdown_engines()
+    return 0
 
-        # Extract JSON from response (handle markdown code blocks)
-        if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-            response_text = response_text.strip()
 
-        scores = json.loads(response_text)
-        return {"raw_scores": scores}
+def make_chat_fn(args):
+    from vllm import SamplingParams
 
-    except Exception as e:
-        return {"raw_scores": None, "error": str(e)}
+    llm = load_llm(args.judge_model, args)
+    tokenizer = llm.get_tokenizer()
+
+    def chat(prompts, temperature):
+        results = [("", "prompt_too_long")] * len(prompts)
+        send, params = [], []
+        for i, p in enumerate(prompts):
+            budget = min(args.max_tokens, args.max_model_len - len(tokenizer.encode(p)) - 64)
+            if budget >= 1024:
+                send.append(i)
+                params.append(SamplingParams(temperature=temperature, max_tokens=budget))
+        if send:
+            messages = [[{"role": "user", "content": prompts[i]}] for i in send]
+            outputs = llm.chat(messages, params, chat_template_kwargs={"enable_thinking": False})
+            for i, o in zip(send, outputs):
+                results[i] = (o.outputs[0].text, str(o.outputs[0].finish_reason))
+        return results
+
+    return chat
+
+
+def judge_all(prompts, chat_fn, retries):
+    results, pending = {}, list(prompts)
+    for attempt in range(1, retries + 2):
+        if not pending:
+            break
+        still = []
+        for key, (text, finish) in zip(pending, chat_fn([prompts[k] for k in pending], 0.0)):
+            raw = scoring.parse_reply(text)
+            if raw is None:
+                still.append(key)
+                results[key] = {"scores": None, "counts": None, "attempts": attempt,
+                                "error": f"unusable judge reply (finish_reason={finish})"}
+            else:
+                results[key] = {"scores": raw, "counts": scoring.recall_counts(raw), "attempts": attempt, "error": None}
+        pending = still
+    return results
+
+
+def judge_videos(keys, samples, predictions, chat_fn, retries):
+    rows, prompts = {}, {}
+    for key in keys:
+        answer = predictions[key]["answer"]
+        if answer is None:
+            rows[key] = {"status": "no_answer", "scores": None, "attempts": 0,
+                         "counts": scoring.zero_counts(ground_truth_json(samples[key[0]])),
+                         "error": "the reasoning did not finish"}
+        else:
+            prompts[key] = build_judge_prompt(samples[key[0]], answer)
+    if prompts:
+        for key, res in judge_all(prompts, chat_fn, retries).items():
+            rows[key] = {"status": "judged" if res["scores"] is not None else "judge_failed", **res}
+    return [{"video_id": k[0], "sample": k[1], "source": samples[k[0]]["source"], **rows[k]} for k in keys]
+
+
+def cmd_judge(args):
+    predictions = {(r["video_id"], r["sample"]): r for r in read_jsonl(args.predictions)}
+    if not predictions:
+        log.error("no predictions in %s, run generate first", args.predictions)
+        return 1
+    samples = {s["video_id"]: s for s in load_finew3(args)}
+    keys = sorted(k for k in predictions if k[0] in samples)
+    done = {(r["video_id"], r["sample"]) for r in read_jsonl(args.output) if r["status"] in ("judged", "no_answer")}
+    todo = [k for k in keys if k not in done]
+    to_judge = sum(1 for k in todo if predictions[k]["answer"] is not None)
+    log.info("%d answers to score, %d of them need the judge", len(todo), to_judge)
+
+    if todo:
+        chat_fn = make_chat_fn(args) if to_judge else None
+        try:
+            for chunk in chunks(todo, args.chunk_size):
+                append_jsonl(args.output, judge_videos(chunk, samples, predictions, chat_fn, args.retries))
+        finally:
+            shutdown_engines()
+    return report(args, {k[0] for k in keys})
+
+
+def report(args, video_ids=None):
+    latest = {}
+    for r in read_jsonl(args.output):
+        if video_ids is None or r["video_id"] in video_ids:
+            latest[(r["video_id"], r["sample"])] = r
+    if not latest:
+        log.error("no judgments in %s", args.output)
+        return 1
+    weights = {"what": args.lambda_what, "who": args.lambda_who, "where": args.lambda_where}
+    agg = scoring.aggregate(latest.values(), weights)
+    print(scoring.format_report(agg))
+    with open(args.summary, "w", encoding="utf-8") as f:
+        json.dump(agg, f, indent=2)
+    return 0
+
+
+def cmd_score(args):
+    if "all" in args.sources:
+        return report(args)
+    return report(args, {r["video_id"] for r in read_jsonl(args.output) if r["source"] in args.sources})
+
+
+def build_parser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+
+    def data_args(sp, output):
+        sp.add_argument("--dataset", default=DATASET)
+        sp.add_argument("--sources", nargs="+", default=["UCA"], help="UCA, ECVA or all")
+        sp.add_argument("--limit", type=int, help="only the first N videos")
+        sp.add_argument("--output", default=output)
+
+    def vllm_args(sp, max_model_len):
+        sp.add_argument("--tensor-parallel-size", type=int, default=1)
+        sp.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+        sp.add_argument("--max-model-len", type=int, default=max_model_len)
+
+    def score_args(sp):
+        sp.add_argument("--lambda-what", type=float, default=scoring.PAPER_WEIGHTS["what"])
+        sp.add_argument("--lambda-who", type=float, default=scoring.PAPER_WEIGHTS["who"])
+        sp.add_argument("--lambda-where", type=float, default=scoring.PAPER_WEIGHTS["where"])
+        sp.add_argument("--summary", default="fv_score.json")
+
+    g = sub.add_parser("generate", help="the LVLM describes each video")
+    data_args(g, "predictions.jsonl")
+    vllm_args(g, 65536)
+    g.add_argument("--model", default=DEFAULT_MODEL)
+    g.add_argument("--video-dir", required=True, help="directory with {video_id}.mp4 files")
+    g.add_argument("--fps", type=float, default=2.0)
+    g.add_argument("--min-pixels", type=int, default=128 * 28 * 28)
+    g.add_argument("--max-pixels", type=int, default=1638400)
+    g.add_argument("--max-new-tokens", type=int, default=16384, help="reasoning and answer together")
+    g.add_argument("--batch-size", type=int, default=16)
+    g.add_argument("--k", type=int, default=4, help="answers per video (mean@k)")
+    g.add_argument("--seed", type=int, default=0)
+    g.add_argument("--temperature", type=float, default=1.0)
+    g.add_argument("--top-p", type=float, default=0.95)
+    g.add_argument("--top-k", type=int, default=20)
+    g.add_argument("--min-p", type=float, default=0.0)
+    g.add_argument("--presence-penalty", type=float, default=1.5)
+    g.add_argument("--repetition-penalty", type=float, default=1.0)
+    g.set_defaults(func=cmd_generate)
+
+    j = sub.add_parser("judge", help="the judge scores each answer and FV-Score is printed")
+    data_args(j, "judgments.jsonl")
+    vllm_args(j, 65536)
+    score_args(j)
+    j.add_argument("--predictions", default="predictions.jsonl")
+    j.add_argument("--judge-model", default=DEFAULT_JUDGE)
+    j.add_argument("--max-tokens", type=int, default=20480)
+    j.add_argument("--retries", type=int, default=2)
+    j.add_argument("--chunk-size", type=int, default=256)
+    j.set_defaults(func=cmd_judge)
+
+    s = sub.add_parser("score", help="FV-Score from a judgments file")
+    s.add_argument("--output", default="judgments.jsonl")
+    s.add_argument("--sources", nargs="+", default=["all"])
+    score_args(s)
+    s.set_defaults(func=cmd_score)
+    return p
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Qwen2.5-VL on FineW3")
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="Qwen/Qwen3-VL-8B-Instruct",
-        help="Model name or path",
-    )
-    parser.add_argument(
-        "--tensor-parallel-size",
-        type=int,
-        default=1,
-        help="Number of GPUs for tensor parallelism",
-    )
-    parser.add_argument(
-        "--gpu-memory-utilization",
-        type=float,
-        default=0.9,
-        help="Fraction of GPU memory to use (0.0-1.0)",
-    )
-    parser.add_argument(
-        "--mm-processor-cache-gb",
-        type=float,
-        default=4.0,
-        help="GB of memory for multimodal processor cache",
-    )
-    parser.add_argument(
-        "--video-dir",
-        type=str,
-        required=True,
-        help="Directory containing video files",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="results.json",
-        help="Output file for results",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Limit number of samples to process",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=-1,
-        help="Batch size for vLLM inference. -1 means all inputs at once (default: -1)",
-    )
-    parser.add_argument(
-        "--gemini-api-key",
-        type=str,
-        default=None,
-        help="Gemini API key for FV-Score evaluation (optional)",
-    )
-    parser.add_argument(
-        "--gemini-model",
-        type=str,
-        default="gemini-3-flash-preview",
-        help="Gemini model to use for evaluation",
-    )
-    args = parser.parse_args()
-
-    # Initialize Gemini for evaluation if API key provided
-    gemini_client = None
-    if args.gemini_api_key:
-        if not GEMINI_AVAILABLE:
-            print("Warning: google-genai not installed. Skipping evaluation.")
-        else:
-            gemini_client = genai.Client(api_key=args.gemini_api_key)
-            print(f"Gemini evaluation enabled with model: {args.gemini_model}")
-    else:
-        print("No Gemini API key provided. Predictions will be saved without evaluation.")
-
-    print(f"Loading model: {args.model}")
-    llm, processor = create_model(
-        args.model,
-        args.tensor_parallel_size,
-        args.gpu_memory_utilization,
-        args.mm_processor_cache_gb,
-    )
-
-    print("Loading FineW3 dataset...")
-    dataset = load_finew3_dataset()
-
-    if args.limit:
-        dataset = dataset.select(range(min(args.limit, len(dataset))))
-
-    # Prepare all inputs first
-    print("Preparing video inputs...")
-    samples_list = list(dataset)
-    prepared_inputs = []
-    valid_indices = []  # Track which samples were successfully prepared
-
-    for i, sample in enumerate(tqdm(samples_list, desc="Preparing inputs")):
-        if sample.get("source") == "ECVA":
-            continue
-
-        video_id = sample["video_id"]
-        video_path = os.path.join(args.video_dir, f"{video_id}.mp4")
-
-        try:
-            input_data = prepare_inference_input(processor, video_path, PROMPT_TEMPLATE)
-            prepared_inputs.append(input_data)
-            valid_indices.append(i)
-        except Exception as e:
-            print(f"  Error preparing {video_id}: {e}")
-
-    # Determine batch size
-    batch_size = len(prepared_inputs) if args.batch_size == -1 else args.batch_size
-
-    # Run batch inference
-    print(f"Running inference with batch size: {batch_size if args.batch_size != -1 else 'all'} ({len(prepared_inputs)} total inputs)")
-    all_predictions = []
-
-    for batch_start in tqdm(range(0, len(prepared_inputs), batch_size), desc="Processing batches"):
-        batch_end = min(batch_start + batch_size, len(prepared_inputs))
-        batch_inputs = prepared_inputs[batch_start:batch_end]
-
-        batch_predictions = run_batch_inference(llm, processor, batch_inputs)
-        all_predictions.extend(batch_predictions)
-
-    # Build results with evaluation
-    results = []
-    prediction_idx = 0
-
-    for i, sample in enumerate(samples_list):
-        if sample.get("source") == "ECVA":
-            continue
-
-        video_id = sample["video_id"]
-
-        if i in valid_indices:
-            prediction = all_predictions[prediction_idx]
-            prediction_idx += 1
-
-            try:
-                ground_truth = {
-                    "events": json.loads(sample["events"]) if sample["events"] else None,
-                    "entities": json.loads(sample["entities"]) if sample["entities"] else None,
-                    "scene": json.loads(sample["scene"]) if sample["scene"] else None,
-                }
-
-                scores = evaluate_response(prediction, ground_truth, gemini_client, args.gemini_model)
-
-                results.append({
-                    "video_id": video_id,
-                    "prediction": prediction,
-                    "scores": scores,
-                })
-            except Exception as e:
-                print(f"  Error evaluating {video_id}: {e}")
-                results.append({
-                    "video_id": video_id,
-                    "prediction": prediction,
-                    "error": str(e),
-                })
-        else:
-            results.append({
-                "video_id": video_id,
-                "error": "Failed to prepare input",
-            })
-
-    with open(args.output, "w") as f:
-        json.dump(results, f, indent=2)
-
-    print(f"Results saved to {args.output}")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    install_signal_handlers()
+    args = build_parser().parse_args()
+    return args.func(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,1 +1,9 @@
-*.sh
+__pycache__/
+.venv/
+.idea/
+.DS_Store
+logs/
+predictions*.jsonl
+judgments*.jsonl
+fv_score*.json
+results*.json

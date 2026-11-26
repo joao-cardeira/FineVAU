@@ -1,0 +1,5 @@
+vllm==0.22.1
+transformers
+datasets
+qwen-vl-utils==0.0.14
+tqdm
